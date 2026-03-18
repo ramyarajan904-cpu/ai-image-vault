@@ -3,5 +3,4 @@ uvicorn
 pillow
 imagehash
 numpy
-tensorflow
 python-multipart
