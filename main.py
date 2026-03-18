@@ -1,41 +1,48 @@
-import os, io, hashlib, zipfile, uvicorn, numpy as np, base64
-import asyncio
+import os, io, hashlib, zipfile, base64, asyncio
 from PIL import Image, ImageOps, ImageFilter
 import imagehash
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ✅ ROOT ROUTE (IMPORTANT)
+@app.get("/")
+def home():
+    return {"message": "Server is running"}
+
+# 🔹 Image Fingerprint Function
 def get_image_fingerprint(img_bytes):
-    md5_hash = hashlib.md5(img_bytes).hexdigest()
+    raw_img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+    raw_img = ImageOps.exif_transpose(raw_img)
 
-    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-    img = ImageOps.exif_transpose(img)
+    # Blur (remove brightness noise)
+    processed = raw_img.filter(ImageFilter.GaussianBlur(1))
 
-    # Slight blur → avoid brightness noise
-    processed = img.filter(ImageFilter.GaussianBlur(radius=1.0))
+    dh = imagehash.dhash(processed)
 
-    # dHash
-    dhash = imagehash.dhash(processed)
-
-    # Preview (for Flutter UI)
+    # Preview for UI
     buf = io.BytesIO()
-    preview = img.copy()
+    preview = raw_img.copy()
     preview.thumbnail((300, 300))
-    preview.save(buf, format="JPEG", quality=80)
+    preview.save(buf, format="JPEG")
     img_str = base64.b64encode(buf.getvalue()).decode('utf-8')
 
-    return md5_hash, dhash, img_str
+    return dh, img_str
 
-
+# 🔥 WebSocket
 @app.websocket("/ws/check-duplicate")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
-    known_md5s = set()
-    originals_bank = []  # (dhash, filename)
+    originals_bank = []  # [(hash, filename)]
 
     try:
         data = await websocket.receive_bytes()
@@ -44,63 +51,54 @@ async def websocket_endpoint(websocket: WebSocket):
         if zipfile.is_zipfile(io.BytesIO(data)):
             with zipfile.ZipFile(io.BytesIO(data)) as z:
 
-                all_files = [
-                    f for f in z.infolist()
-                    if not f.is_dir() and f.filename.lower().endswith(('.png', '.jpg', '.jpeg'))
+                files = [
+                    f for f in z.namelist()
+                    if f.lower().endswith(('.png', '.jpg', '.jpeg'))
                 ]
 
-                # 🔥 IMPORTANT FIX → preserve original order (NO sorting)
-                total_count = len(all_files)
+                # ❗ IMPORTANT: preserve original order (NO SORT)
+                total = len(files)
 
-                for i, f_info in enumerate(all_files):
-                    img_bytes = z.read(f_info.filename)
-                    fname = os.path.basename(f_info.filename)
+                for i, file in enumerate(files):
+                    img_bytes = z.read(file)
+                    fname = os.path.basename(file)
 
-                    curr_md5, curr_dh, preview_b64 = get_image_fingerprint(img_bytes)
+                    curr_hash, preview = get_image_fingerprint(img_bytes)
 
                     status = "Unique"
-                    similarity = 0.0
-                    found_match = False
+                    similarity = 100
+                    found = False
 
-                    # ✅ 1. Exact duplicate
-                    if curr_md5 in known_md5s:
-                        status = "Exact Duplicate"
-                        similarity = 100.0
-                        found_match = True
+                    # 🔍 Compare with originals
+                    for orig_hash, _ in originals_bank:
+                        diff = curr_hash - orig_hash
 
-                    else:
-                        # ✅ 2. Near duplicate using dHash
-                        for orig_dh, _ in originals_bank:
-                            hash_diff = curr_dh - orig_dh
+                        if diff < 10:  # threshold
+                            status = "Duplicate"
+                            similarity = round((1 - diff / 64) * 100, 2)
+                            found = True
+                            break
 
-                            if hash_diff < 10:  # 🔥 tuned threshold
-                                status = "Near-Duplicate"
-                                similarity = float(round((1 - hash_diff / 64) * 100, 2))
-                                found_match = True
-                                break
-
-                    # ✅ 3. Store only TRUE originals
-                    if not found_match:
-                        known_md5s.add(curr_md5)
-                        originals_bank.append((curr_dh, fname))
-                        similarity = 100.0
+                    # ✅ Store ONLY if original
+                    if not found:
+                        originals_bank.append((curr_hash, fname))
 
                     results_list.append({
                         "uploaded_file": fname,
                         "status": status,
                         "similarity_percentage": similarity,
-                        "image_data": preview_b64
+                        "image_data": preview
                     })
 
-                    # ✅ FIXED progress (no stuck at 1)
+                    # 🔥 PROGRESS FIX
                     await websocket.send_json({
                         "type": "progress",
                         "current": i + 1,
-                        "total": total_count,
-                        "message": f"Analyzing {fname}..."
+                        "total": total,
+                        "message": f"Processing {fname}"
                     })
 
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.1)
 
         await websocket.send_json({
             "type": "complete",
@@ -115,7 +113,3 @@ async def websocket_endpoint(websocket: WebSocket):
 
     finally:
         await websocket.close()
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8001)
