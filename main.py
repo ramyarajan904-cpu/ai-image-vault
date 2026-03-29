@@ -1,15 +1,15 @@
 import hashlib
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File as FastFile # Renamed to avoid conflict
 from typing import List
 import torch
-import torch.nn as File
-from torchvision import transforms, models # Using standard torchvision models
+import torch.nn as nn # Standard naming
+from torchvision import transforms, models
 from PIL import Image
 import io
 import imagehash
 import uvicorn
 import os
-import gc # Garbage Collector to save RAM
+import gc
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -23,10 +23,9 @@ app.add_middleware(
 
 processed_images = []
 
-# --- ULTRA LIGHT MODEL: MobileNetV2 ---
-# This uses much less RAM than ViT
-model = models.mobilenet_v2(pretrained=True)
-model.classifier = torch.nn.Identity() # Remove the last layer to get features
+# --- ULTRA LIGHT MODEL ---
+model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
+model.classifier = nn.Identity() 
 model.eval()
 
 preprocess = transforms.Compose([
@@ -42,24 +41,24 @@ def get_embedding(image_pil):
     img_tensor = preprocess(image_pil).unsqueeze(0)
     with torch.no_grad():
         features = model(img_tensor)
-        # Flatten and Normalize
         features = torch.flatten(features, 1)
         features = torch.nn.functional.normalize(features, p=2, dim=1)
     return features
 
 @app.get("/")
 def health():
-    return {"status": "online", "mode": "Ultra-Light-MobileNet"}
+    return {"status": "online", "mode": "Ultra-Light-MobileNet-v2"}
 
 @app.get("/reset_session")
 def reset_session():
     global processed_images
     processed_images = []
-    gc.collect() # Force clear RAM
+    gc.collect()
     return {"status": "success", "message": "Memory Cleared"}
 
+# --- FIXED THIS LINE ---
 @app.post("/compare")
-async def compare_batch(files: List[UploadFile] = File(...)):
+async def compare_batch(files: List[UploadFile] = FastFile(...)):
     global processed_images
     batch_results = []
 
@@ -75,24 +74,21 @@ async def compare_batch(files: List[UploadFile] = File(...)):
             match_data = None
 
             for old_img in processed_images:
-                # 1. MD5 Check
                 if current_md5 == old_img["md5"]:
                     is_match = True
                     match_data = {"pair": [file.filename, old_img["filename"]], "similarity": 100, "status": "Exact Duplicate"}
                     break
                 
-                # 2. dHash Check
                 hash_diff = current_dhash - old_img["dhash"]
                 if hash_diff == 0:
                     is_match = True
                     match_data = {"pair": [file.filename, old_img["filename"]], "similarity": 100, "status": "Exact Duplicate"}
                     break
                 
-                # 3. MobileNet Similarity
                 cos_sim = torch.nn.functional.cosine_similarity(feat, old_img["features"]).item()
                 sim_percent = round(cos_sim * 100, 2)
 
-                if hash_diff <= 2 or sim_percent > 92.0: # MobileNet needs higher threshold
+                if hash_diff <= 2 or sim_percent > 92.0:
                     is_match = True
                     match_data = {"pair": [file.filename, old_img["filename"]], "similarity": sim_percent, "status": "Near-Duplicate"}
                     break
@@ -110,7 +106,6 @@ async def compare_batch(files: List[UploadFile] = File(...)):
         except Exception:
             continue
     
-    # After batch is done, clear cache
     gc.collect() 
     return {"duplicates": batch_results}
 
