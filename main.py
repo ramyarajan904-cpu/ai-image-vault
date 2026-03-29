@@ -1,94 +1,130 @@
-import os, io, zipfile, base64, asyncio, gc
-from PIL import Image, ImageOps, ImageFilter
+import hashlib
+from fastapi import FastAPI, UploadFile, File
+from typing import List
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+import timm
+from PIL import Image
+import io
 import imagehash
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import uvicorn
+import os
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# 1. CORS Setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global Session Memory
+processed_images = []
+
+# 2. AI Model (ViT) Setup - Using a very small model for Render Free Tier
+model_name = 'vit_tiny_patch16_224'
+# Pretrained model-ah load panni RAM-ah optimize panrom
+model = timm.create_model(model_name, pretrained=True, num_classes=0)
+model.eval()
+
+preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# --- HELPER FUNCTIONS ---
+def get_md5(content):
+    return hashlib.md5(content).hexdigest()
+
+def get_vit_embedding(image_pil):
+    img_tensor = preprocess(image_pil).unsqueeze(0)
+    with torch.no_grad():
+        features = model(img_tensor)
+        features = F.normalize(features, p=2, dim=1)
+    return features
 
 @app.get("/")
-def home():
-    return {"message": "Server is running"}
+def health_check():
+    return {"status": "online", "model": "ViT-Tiny Live"}
 
-def get_image_fingerprint(img_bytes):
-    with Image.open(io.BytesIO(img_bytes)) as raw_img:
-        raw_img = raw_img.convert('RGB')
-        raw_img = ImageOps.exif_transpose(raw_img)
-        processed = raw_img.filter(ImageFilter.GaussianBlur(1))
-        dh = imagehash.dhash(processed)
-        
-        buf = io.BytesIO()
-        preview = raw_img.copy()
-        preview.thumbnail((120, 120)) # Reduced size for faster transfer
-        preview.save(buf, format="JPEG", quality=60)
-        img_str = base64.b64encode(buf.getvalue()).decode('utf-8')
-    return dh, img_str
+@app.get("/reset_session")
+def reset_session():
+    global processed_images
+    processed_images = []
+    return {"status": "success", "message": "Memory Reset"}
 
-@app.websocket("/ws/check-duplicate")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    originals_bank = [] 
+# --- MAIN API ---
+@app.post("/compare")
+async def compare_batch(files: List[UploadFile] = File(...)):
+    global processed_images
+    batch_results = []
 
-    try:
-        # Wait for ZIP bytes
-        data = await websocket.receive_bytes()
-        
-        if zipfile.is_zipfile(io.BytesIO(data)):
-            with zipfile.ZipFile(io.BytesIO(data)) as z:
-                files = [f for f in z.namelist() if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                files.sort(key=lambda x: (len(x), x))
-                
-                total = len(files)
-                for i, file in enumerate(files):
-                    try:
-                        img_bytes = z.read(file)
-                        fname = os.path.basename(file)
-                        curr_hash, preview = get_image_fingerprint(img_bytes)
-
-                        status, similarity, found = "Unique", 100, False
-                        for orig_hash, _ in originals_bank:
-                            diff = curr_hash - orig_hash
-                            if diff < 12: 
-                                status = "Near-Duplicate"
-                                similarity = round((1 - diff / 64) * 100, 2)
-                                found = True
-                                break
-
-                        if not found:
-                            originals_bank.append((curr_hash, fname))
-
-                        # LIVE UPDATE
-                        await websocket.send_json({
-                            "type": "progress",
-                            "current": i + 1,
-                            "total": total,
-                            "message": f"Processing {fname}",
-                            "single_result": {
-                                "uploaded_file": fname,
-                                "status": status,
-                                "similarity_percentage": similarity,
-                                "image_data": preview
-                            }
-                        })
-                        
-                        # Prevent Timeout: Small sleep to let event loop breathe
-                        if i % 5 == 0:
-                            await asyncio.sleep(0.01)
-                        if i % 20 == 0:
-                            gc.collect()
-
-                    except Exception as img_err:
-                        print(f"Error processing {file}: {img_err}")
-                        continue
-
-        await websocket.send_json({"type": "complete"})
-    except WebSocketDisconnect:
-        print("Client disconnected")
-    except Exception as e:
-        await websocket.send_json({"type": "error", "message": str(e)})
-    finally:
+    for file in files:
         try:
-            await websocket.close()
-        except:
-            pass
+            content = await file.read()
+            
+            # STAGE 1: MD5 (Byte-level)
+            current_md5 = get_md5(content)
+            
+            # Convert to PIL
+            img_pil = Image.open(io.BytesIO(content)).convert('RGB')
+            
+            # STAGE 2: dHash (Structural)
+            current_dhash = imagehash.dhash(img_pil)
+            
+            # STAGE 3: ViT (Semantic)
+            feat = get_vit_embedding(img_pil)
+            
+            is_match = False
+            match_data = None
+
+            for old_img in processed_images:
+                # 1. Check MD5 (Bit-by-bit same)
+                if current_md5 == old_img["md5"]:
+                    is_match = True
+                    match_data = {"pair": [file.filename, old_img["filename"]], "similarity": 100, "status": "Exact Duplicate"}
+                    break
+                
+                # 2. Check dHash (Structure same)
+                hash_diff = current_dhash - old_img["dhash"]
+                if hash_diff == 0:
+                    is_match = True
+                    match_data = {"pair": [file.filename, old_img["filename"]], "similarity": 100, "status": "Exact Duplicate"}
+                    break
+                
+                # 3. Check AI Similarity (Content similarity)
+                cos_sim = F.cosine_similarity(feat, old_img["features"]).item()
+                sim_percent = round(cos_sim * 100, 2)
+
+                # Similarity threshold: 88% and above is considered Near-Duplicate
+                if hash_diff <= 2 or sim_percent > 88.0:
+                    is_match = True
+                    match_data = {"pair": [file.filename, old_img["filename"]], "similarity": sim_percent, "status": "Near-Duplicate"}
+                    break
+
+            # Save for next comparison
+            processed_images.append({
+                "filename": file.filename,
+                "md5": current_md5,
+                "dhash": current_dhash,
+                "features": feat
+            })
+
+            if is_match:
+                batch_results.append(match_data)
+
+        except Exception as e:
+            print(f"Error processing {file.filename}: {e}")
+            continue
+
+    return {"duplicates": batch_results}
+
+if __name__ == "__main__":
+    # Render logic dynamic port
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
